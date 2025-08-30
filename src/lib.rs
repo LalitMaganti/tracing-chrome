@@ -253,6 +253,8 @@ enum Message {
     Event(f64, Callsite),
     Exit(f64, Callsite, Option<u64>),
     NewThread(usize, String),
+    FlowStart(f64, u64, String, String, usize),
+    FlowEnd(f64, u64, String, String, usize),
     Flush,
     Drop,
     StartNew(Option<Box<dyn Write + Send>>),
@@ -347,6 +349,8 @@ where
                         ("e", Some(ts), Some(callsite), Some(root_id))
                     }
                     Message::NewThread(_tid, _name) => ("M", None, None, None),
+                    Message::FlowStart(_ts, _flow_id, _name, _cat, _tid) => ("s", None, None, None),
+                    Message::FlowEnd(_ts, _flow_id, _name, _cat, _tid) => ("f", None, None, None),
                     Message::Flush | Message::Drop | Message::StartNew(_) => {
                         panic!("Was supposed to break by now.")
                     }
@@ -361,6 +365,18 @@ where
                     entry["name"] = "thread_name".into();
                     entry["tid"] = tid.into();
                     entry["args"] = json!({ "name": name });
+                } else if let Message::FlowStart(ts, flow_id, name, cat, tid) = msg {
+                    entry["ts"] = ts.into();
+                    entry["name"] = name.into();
+                    entry["cat"] = cat.into();
+                    entry["tid"] = tid.into();
+                    entry["id"] = flow_id.into();
+                } else if let Message::FlowEnd(ts, flow_id, name, cat, tid) = msg {
+                    entry["ts"] = ts.into();
+                    entry["name"] = name.into();
+                    entry["cat"] = cat.into();
+                    entry["tid"] = tid.into();
+                    entry["id"] = flow_id.into();
                 } else {
                     let ts = ts.unwrap();
                     let callsite = callsite.unwrap();
@@ -592,6 +608,35 @@ where
 
         let ts = self.get_ts();
         self.exit_span(ctx.span(&id).expect("Span not found."), ts);
+    }
+
+    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
+        let follows_span = ctx.span(follows);
+        let current_span = ctx.span(span);
+
+        if let (Some(follows_span), Some(current_span)) = (follows_span, current_span) {
+            let ts = self.get_ts();
+            let flow_id = follows.into_u64();
+
+            let follows_callsite = self.get_callsite(EventOrSpan::Span(&follows_span));
+            let current_callsite = self.get_callsite(EventOrSpan::Span(&current_span));
+
+            self.send_message(Message::FlowStart(
+                ts,
+                flow_id,
+                follows_callsite.name,
+                follows_callsite.target,
+                follows_callsite.tid,
+            ));
+
+            self.send_message(Message::FlowEnd(
+                ts,
+                flow_id,
+                current_callsite.name,
+                current_callsite.target,
+                current_callsite.tid,
+            ));
+        }
     }
 }
 
