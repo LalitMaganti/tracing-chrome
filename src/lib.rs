@@ -377,7 +377,7 @@ where
                     entry["cat"] = cat.into();
                     entry["tid"] = tid.into();
                     entry["id"] = flow_id.into();
-                    entry["bp"] = "e".into();
+                    // Flow end uses default "next slice" binding, no bp needed
                 } else {
                     let ts = ts.unwrap();
                     let callsite = callsite.unwrap();
@@ -632,7 +632,8 @@ where
 
         if let (Some(follows_span), Some(current_span)) = (follows_span, current_span) {
             let flow_id = follows.into_u64();
-            let current_callsite = self.get_callsite(EventOrSpan::Span(&current_span));
+            let source_callsite = self.get_callsite(EventOrSpan::Span(&follows_span));
+            let target_callsite = self.get_callsite(EventOrSpan::Span(&current_span));
             let fallback_ts = self.get_ts();
             
             // Get source timestamp from ArgsWrapper
@@ -647,22 +648,22 @@ where
                 .and_then(|wrapper| wrapper.start_ts)
                 .unwrap_or(fallback_ts);
 
-            // Emit flow start event with source span's timestamp
+            // Emit flow start event with source span's timestamp and callsite
             self.send_message(Message::FlowStart(
                 source_ts,
                 flow_id,
-                current_callsite.name.clone(),
-                current_callsite.target.clone(),
-                current_callsite.tid,
+                source_callsite.name,
+                source_callsite.target,
+                source_callsite.tid,
             ));
             
-            // Emit flow end event with target span's timestamp (uses "bp": "e")
+            // Emit flow end event with target span's timestamp and callsite (next slice binding)
             self.send_message(Message::FlowEnd(
                 target_ts,
                 flow_id,
-                current_callsite.name,
-                current_callsite.target,
-                current_callsite.tid,
+                target_callsite.name,
+                target_callsite.target,
+                target_callsite.tid,
             ));
         }
     }
