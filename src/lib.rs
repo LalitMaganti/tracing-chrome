@@ -254,6 +254,7 @@ enum Message {
     Exit(f64, Callsite, Option<u64>),
     NewThread(usize, String),
     FlowStart(f64, u64, String, String, usize),
+    FlowEnd(f64, u64, String, String, usize),
     Flush,
     Drop,
     StartNew(Option<Box<dyn Write + Send>>),
@@ -349,6 +350,7 @@ where
                     }
                     Message::NewThread(_tid, _name) => ("M", None, None, None),
                     Message::FlowStart(_ts, _flow_id, _name, _cat, _tid) => ("s", None, None, None),
+                    Message::FlowEnd(_ts, _flow_id, _name, _cat, _tid) => ("f", None, None, None),
                     Message::Flush | Message::Drop | Message::StartNew(_) => {
                         panic!("Was supposed to break by now.")
                     }
@@ -369,6 +371,13 @@ where
                     entry["cat"] = cat.into();
                     entry["tid"] = tid.into();
                     entry["id"] = flow_id.into();
+                } else if let Message::FlowEnd(ts, flow_id, name, cat, tid) = msg {
+                    entry["ts"] = ts.into();
+                    entry["name"] = name.into();
+                    entry["cat"] = cat.into();
+                    entry["tid"] = tid.into();
+                    entry["id"] = flow_id.into();
+                    entry["bp"] = "e".into();
                 } else {
                     let ts = ts.unwrap();
                     let callsite = callsite.unwrap();
@@ -624,15 +633,32 @@ where
         if let (Some(follows_span), Some(current_span)) = (follows_span, current_span) {
             let flow_id = follows.into_u64();
             let current_callsite = self.get_callsite(EventOrSpan::Span(&current_span));
+            let fallback_ts = self.get_ts();
             
-            // Get timestamp from existing ArgsWrapper
+            // Get source timestamp from ArgsWrapper
             let source_ts = follows_span.extensions()
                 .get::<ArgsWrapper>()
                 .and_then(|wrapper| wrapper.start_ts)
-                .unwrap_or_else(|| self.get_ts());
+                .unwrap_or(fallback_ts);
+                
+            // Get target timestamp from ArgsWrapper  
+            let target_ts = current_span.extensions()
+                .get::<ArgsWrapper>()
+                .and_then(|wrapper| wrapper.start_ts)
+                .unwrap_or(fallback_ts);
 
+            // Emit flow start event with source span's timestamp
             self.send_message(Message::FlowStart(
                 source_ts,
+                flow_id,
+                current_callsite.name.clone(),
+                current_callsite.target.clone(),
+                current_callsite.tid,
+            ));
+            
+            // Emit flow end event with target span's timestamp (uses "bp": "e")
+            self.send_message(Message::FlowEnd(
+                target_ts,
                 flow_id,
                 current_callsite.name,
                 current_callsite.target,
