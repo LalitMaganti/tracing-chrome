@@ -23,11 +23,13 @@ use std::sync::mpsc::Sender;
 use std::{
     cell::{Cell, RefCell},
     thread::JoinHandle,
+    collections::HashMap,
 };
 
 thread_local! {
     static OUT: RefCell<Option<Sender<Message>>> = const { RefCell::new(None) };
     static TID: RefCell<Option<usize>> = const { RefCell::new(None) };
+    static FOLLOWS_FROM: RefCell<HashMap<u64, Vec<u64>>> = RefCell::new(HashMap::new());
 }
 
 type NameFn<S> = Box<dyn Fn(&EventOrSpan<'_, '_, S>) -> String + Send + Sync>;
@@ -253,8 +255,8 @@ enum Message {
     Event(f64, Callsite),
     Exit(f64, Callsite, Option<u64>),
     NewThread(usize, String),
-    FlowStart(f64, u64, String, String, usize),
-    FlowEnd(f64, u64, String, String, usize),
+    EnterWithFlowEnd(f64, Callsite, Option<u64>, u64, String, String),
+    ExitWithFlowStart(f64, Callsite, Option<u64>, Vec<(u64, String, String)>),
     Flush,
     Drop,
     StartNew(Option<Box<dyn Write + Send>>),
@@ -349,8 +351,8 @@ where
                         ("e", Some(ts), Some(callsite), Some(root_id))
                     }
                     Message::NewThread(_tid, _name) => ("M", None, None, None),
-                    Message::FlowStart(_ts, _flow_id, _name, _cat, _tid) => ("s", None, None, None),
-                    Message::FlowEnd(_ts, _flow_id, _name, _cat, _tid) => ("f", None, None, None),
+                    Message::EnterWithFlowEnd(_ts, _callsite, _root_id, _flow_id, _name, _cat) => ("B", None, None, None),
+                    Message::ExitWithFlowStart(_ts, _callsite, _root_id, _flows) => ("E", None, None, None),
                     Message::Flush | Message::Drop | Message::StartNew(_) => {
                         panic!("Was supposed to break by now.")
                     }
@@ -365,18 +367,90 @@ where
                     entry["name"] = "thread_name".into();
                     entry["tid"] = tid.into();
                     entry["args"] = json!({ "name": name });
-                } else if let Message::FlowStart(ts, flow_id, name, cat, tid) = msg {
+                } else if let Message::EnterWithFlowEnd(ts, callsite, root_id, flow_id, flow_name, flow_cat) = msg {
+                    // First write the flow end event
+                    let flow_entry = json!({
+                        "ph": "f",
+                        "pid": 1,
+                        "ts": ts,
+                        "name": flow_name,
+                        "cat": flow_cat,
+                        "tid": callsite.tid,
+                        "id": flow_id,
+                        "bp": "e"
+                    });
+                    if has_started {
+                        write.write_all(b",\n").unwrap();
+                    }
+                    serde_json::to_writer(&mut write, &flow_entry).unwrap();
+                    has_started = true;
+
+                    // Then write the enter event
+                    entry["ph"] = match root_id {
+                        None => "B".into(),
+                        Some(_) => "b".into()
+                    };
                     entry["ts"] = ts.into();
-                    entry["name"] = name.into();
-                    entry["cat"] = cat.into();
-                    entry["tid"] = tid.into();
-                    entry["id"] = flow_id.into();
-                } else if let Message::FlowEnd(ts, flow_id, name, cat, tid) = msg {
+                    entry["name"] = callsite.name.clone().into();
+                    entry["cat"] = callsite.target.clone().into();
+                    entry["tid"] = callsite.tid.into();
+                    if let Some(root_id) = root_id {
+                        entry["id"] = root_id.into();
+                    }
+                    if let (Some(file), Some(line)) = (callsite.file, callsite.line) {
+                        entry[".file"] = file.into();
+                        entry[".line"] = line.into();
+                    }
+                    if let Some(call_args) = &callsite.args {
+                        if !call_args.is_empty() {
+                            entry["args"] = (**call_args).clone().into();
+                        }
+                    }
+                } else if let Message::ExitWithFlowStart(ts, callsite, root_id, flows) = msg {
+                    // First write the exit event
+                    entry["ph"] = match root_id {
+                        None => "E".into(),
+                        Some(_) => "e".into()
+                    };
                     entry["ts"] = ts.into();
-                    entry["name"] = name.into();
-                    entry["cat"] = cat.into();
-                    entry["tid"] = tid.into();
-                    entry["id"] = flow_id.into();
+                    entry["name"] = callsite.name.clone().into();
+                    entry["cat"] = callsite.target.clone().into();
+                    entry["tid"] = callsite.tid.into();
+                    if let Some(root_id) = root_id {
+                        entry["id"] = root_id.into();
+                    }
+                    if let (Some(file), Some(line)) = (callsite.file, callsite.line) {
+                        entry[".file"] = file.into();
+                        entry[".line"] = line.into();
+                    }
+                    if let Some(call_args) = &callsite.args {
+                        if !call_args.is_empty() {
+                            entry["args"] = (**call_args).clone().into();
+                        }
+                    }
+
+                    // Write the exit event first
+                    if has_started {
+                        write.write_all(b",\n").unwrap();
+                    }
+                    serde_json::to_writer(&mut write, &entry).unwrap();
+                    has_started = true;
+
+                    // Then write flow start events for each following span
+                    for (flow_id, flow_name, flow_cat) in flows {
+                        let flow_entry = json!({
+                            "ph": "s",
+                            "pid": 1,
+                            "ts": ts,
+                            "name": flow_name,
+                            "cat": flow_cat,
+                            "tid": callsite.tid,
+                            "id": flow_id
+                        });
+                        write.write_all(b",\n").unwrap();
+                        serde_json::to_writer(&mut write, &flow_entry).unwrap();
+                    }
+                    continue;
                 } else {
                     let ts = ts.unwrap();
                     let callsite = callsite.unwrap();
@@ -554,7 +628,31 @@ where
         }
 
         let ts = self.get_ts();
-        self.enter_span(ctx.span(id).expect("Span not found."), ts);
+        let span = ctx.span(id).expect("Span not found.");
+        
+        // Check if this span follows from another span
+        let span_id = id.into_u64();
+        let flow_info = FOLLOWS_FROM.with(|follows| {
+            follows.borrow().get(&span_id).map(|flows| {
+                if let Some(&source_id) = flows.first() {
+                    let callsite = self.get_callsite(EventOrSpan::Span(&span));
+                    Some((source_id, callsite.name.clone(), callsite.target.clone()))
+                } else {
+                    None
+                }
+            }).flatten()
+        });
+
+        if let Some((flow_id, flow_name, flow_cat)) = flow_info {
+            let callsite = self.get_callsite(EventOrSpan::Span(&span));
+            let root_id = match self.trace_style {
+                TraceStyle::Async => Some(ChromeLayer::get_root_id(span)),
+                _ => None,
+            };
+            self.send_message(Message::EnterWithFlowEnd(ts, callsite, root_id, flow_id, flow_name, flow_cat));
+        } else {
+            self.enter_span(span, ts);
+        }
     }
 
     fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
@@ -582,7 +680,37 @@ where
             return;
         }
         let ts = self.get_ts();
-        self.exit_span(ctx.span(id).expect("Span not found."), ts);
+        let span = ctx.span(id).expect("Span not found.");
+        
+        // Check if any spans follow from this one
+        let span_id = id.into_u64();
+        let following_spans = FOLLOWS_FROM.with(|follows| {
+            follows.borrow().iter()
+                .filter_map(|(target_id, source_ids)| {
+                    if source_ids.contains(&span_id) {
+                        if let Some(target_span) = ctx.span(&span::Id::from_u64(*target_id)) {
+                            let target_callsite = self.get_callsite(EventOrSpan::Span(&target_span));
+                            Some((*target_id, target_callsite.name.clone(), target_callsite.target.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
+        if !following_spans.is_empty() {
+            let callsite = self.get_callsite(EventOrSpan::Span(&span));
+            let root_id = match self.trace_style {
+                TraceStyle::Async => Some(ChromeLayer::get_root_id(span)),
+                _ => None,
+            };
+            self.send_message(Message::ExitWithFlowStart(ts, callsite, root_id, following_spans));
+        } else {
+            self.exit_span(span, ts);
+        }
     }
 
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
@@ -610,33 +738,16 @@ where
         self.exit_span(ctx.span(&id).expect("Span not found."), ts);
     }
 
-    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
-        let follows_span = ctx.span(follows);
-        let current_span = ctx.span(span);
-
-        if let (Some(follows_span), Some(current_span)) = (follows_span, current_span) {
-            let ts = self.get_ts();
-            let flow_id = follows.into_u64();
-
-            let follows_callsite = self.get_callsite(EventOrSpan::Span(&follows_span));
-            let current_callsite = self.get_callsite(EventOrSpan::Span(&current_span));
-
-            self.send_message(Message::FlowStart(
-                ts,
-                flow_id,
-                follows_callsite.name,
-                follows_callsite.target,
-                follows_callsite.tid,
-            ));
-
-            self.send_message(Message::FlowEnd(
-                ts,
-                flow_id,
-                current_callsite.name,
-                current_callsite.target,
-                current_callsite.tid,
-            ));
-        }
+    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, _ctx: Context<'_, S>) {
+        let span_id = span.into_u64();
+        let follows_id = follows.into_u64();
+        
+        FOLLOWS_FROM.with(|follows_map| {
+            follows_map.borrow_mut()
+                .entry(span_id)
+                .or_insert_with(Vec::new)
+                .push(follows_id);
+        });
     }
 }
 
