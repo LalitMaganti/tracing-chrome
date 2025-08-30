@@ -23,13 +23,11 @@ use std::sync::mpsc::Sender;
 use std::{
     cell::{Cell, RefCell},
     thread::JoinHandle,
-    collections::HashMap,
 };
 
 thread_local! {
     static OUT: RefCell<Option<Sender<Message>>> = const { RefCell::new(None) };
     static TID: RefCell<Option<usize>> = const { RefCell::new(None) };
-    static FOLLOWS_FROM: RefCell<HashMap<u64, Vec<u64>>> = RefCell::new(HashMap::new());
 }
 
 type NameFn<S> = Box<dyn Fn(&EventOrSpan<'_, '_, S>) -> String + Send + Sync>;
@@ -550,22 +548,11 @@ where
         let ts = self.get_ts();
         let span = ctx.span(id).expect("Span not found.");
         
-        // Check if this span follows from another span and emit flow start
-        let span_id = id.into_u64();
-        FOLLOWS_FROM.with(|follows| {
-            if let Some(source_ids) = follows.borrow().get(&span_id) {
-                for &source_id in source_ids {
-                    let callsite = self.get_callsite(EventOrSpan::Span(&span));
-                    self.send_message(Message::FlowStart(
-                        ts,
-                        source_id,
-                        callsite.name.clone(),
-                        callsite.target.clone(),
-                        callsite.tid,
-                    ));
-                }
-            }
-        });
+        // Store start time in ArgsWrapper (should always exist after on_new_span)
+        let span_ref = ctx.span(id).expect("Span not found.");
+        if let Some(wrapper) = span_ref.extensions_mut().get_mut::<ArgsWrapper>() {
+            wrapper.start_ts = Some(ts);
+        }
 
         self.enter_span(span, ts);
     }
@@ -601,13 +588,18 @@ where
     }
 
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        if self.include_args {
+        let args = if self.include_args {
             let mut args = Object::new();
             attrs.record(&mut JsonVisitor { object: &mut args });
-            ctx.span(id).unwrap().extensions_mut().insert(ArgsWrapper {
-                args: Arc::new(args),
-            });
-        }
+            Arc::new(args)
+        } else {
+            Arc::new(Object::new())
+        };
+        
+        ctx.span(id).unwrap().extensions_mut().insert(ArgsWrapper {
+            args,
+            start_ts: None,
+        });
         if let TraceStyle::Threaded = self.trace_style {
             return;
         }
@@ -625,16 +617,28 @@ where
         self.exit_span(ctx.span(&id).expect("Span not found."), ts);
     }
 
-    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, _ctx: Context<'_, S>) {
-        let span_id = span.into_u64();
-        let follows_id = follows.into_u64();
-        
-        FOLLOWS_FROM.with(|follows_map| {
-            follows_map.borrow_mut()
-                .entry(span_id)
-                .or_insert_with(Vec::new)
-                .push(follows_id);
-        });
+    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
+        let follows_span = ctx.span(follows);
+        let current_span = ctx.span(span);
+
+        if let (Some(follows_span), Some(current_span)) = (follows_span, current_span) {
+            let flow_id = follows.into_u64();
+            let current_callsite = self.get_callsite(EventOrSpan::Span(&current_span));
+            
+            // Get timestamp from existing ArgsWrapper
+            let source_ts = follows_span.extensions()
+                .get::<ArgsWrapper>()
+                .and_then(|wrapper| wrapper.start_ts)
+                .unwrap_or_else(|| self.get_ts());
+
+            self.send_message(Message::FlowStart(
+                source_ts,
+                flow_id,
+                current_callsite.name,
+                current_callsite.target,
+                current_callsite.tid,
+            ));
+        }
     }
 }
 
@@ -651,4 +655,5 @@ impl<'a> tracing_subscriber::field::Visit for JsonVisitor<'a> {
 
 struct ArgsWrapper {
     args: Arc<Object>,
+    start_ts: Option<f64>,
 }
